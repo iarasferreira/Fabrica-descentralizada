@@ -72,7 +72,7 @@ async def main():
         PWD,
         env=env,
         name="A",
-        stock_init={"material_1": 100, "material_2": 80},
+        stock_init={"material_1": 40, "material_2": 40},
         position=(0, 0),
         robots=robots_jids,
     )
@@ -81,7 +81,7 @@ async def main():
         PWD,
         env=env,
         name="B",
-        stock_init={"material_1": 50, "material_2": 120},
+        stock_init={"material_1": 40, "material_2": 40},
         position=(10, 0),
         robots=robots_jids,
     )

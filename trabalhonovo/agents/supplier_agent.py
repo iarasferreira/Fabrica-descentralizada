@@ -14,6 +14,14 @@ class SupplierAgent(FactoryAgent):
     """
     Supplier que participa no CNP de materiais com as máquinas (supply-cnp)
     e delega o transporte em robots (transport-cnp).
+
+    Comportamento de stock:
+    - Inicia com 40 unidades por material (se não for passado stock_init).
+    - Quando rejeita pela primeira vez um pedido por falta de material:
+        * entra em estado "recharging" (parado);
+        * fica 5 ticks sem aceitar pedidos;
+        * ao fim de 5 ticks faz restock para 40 unidades por material;
+        * sai de "recharging" e volta a responder normalmente.
     """
 
     def __init__(
@@ -30,10 +38,19 @@ class SupplierAgent(FactoryAgent):
         self.agent_name = name
         self.position = position
 
+        # === Gestão de stock ===
+        self.max_stock_per_material = 40
+
+        # Se não vier stock_init, começamos com 40 de cada material
         self.stock = stock_init or {
-            "material_1": 100,
-            "material_2": 100,
+            "material_1": self.max_stock_per_material,
+            "material_2": self.max_stock_per_material,
         }
+
+        # Estado de "recharging" (paragem para restock)
+        self.recharging = False
+        self.recharge_start_tick = None
+        self.recharge_duration_ticks = 5  # pára 5 ticks antes de fazer restock
 
         # Robots disponíveis
         self.robots = robots or []
@@ -76,7 +93,45 @@ class SupplierAgent(FactoryAgent):
                     requested = data.get("materials", {})
                     machine_pos = data.get("machine_pos", [0, 0])
 
-                    # verificar stock suficiente
+                    # --- Gestão do estado de "recharging" ---
+                    current_tick = agent.env.time if agent.env else None
+
+                    if agent.recharging:
+                        # Verificar se já passaram os 5 ticks de paragem
+                        if (
+                            current_tick is not None
+                            and agent.recharge_start_tick is not None
+                            and current_tick - agent.recharge_start_tick
+                            >= agent.recharge_duration_ticks
+                        ):
+                            # Conclui restock: repõe stock para 40 por material
+                            for mat in agent.stock.keys():
+                                agent.stock[mat] = agent.max_stock_per_material
+
+                            agent.recharging = False
+                            agent.recharge_start_tick = None
+
+                            await agent.log(
+                                f"[SUPPLIER/{agent.agent_name}] Restock concluído. "
+                                f"Stock reposto para {agent.stock}."
+                            )
+                            # Depois disto, continua a tratar CFP normalmente.
+                        else:
+                            # Ainda a recarregar → recusa todos os CFP
+                            rep = Message(to=str(msg.sender))
+                            rep.set_metadata("protocol", "supply-cnp")
+                            rep.set_metadata("performative", "refuse")
+                            rep.set_metadata("thread", thread_id)
+                            rep.body = json.dumps({"reason": "recharging"})
+                            await self.send(rep)
+
+                            await agent.log(
+                                f"[SUPPLIER/{agent.agent_name}] REFUSE para {msg.sender} "
+                                "(em recharging, a repor stock)"
+                            )
+                            return
+
+                    # --- Verificar stock suficiente ---
                     has_stock = True
                     for mat, qty in requested.items():
                         if agent.stock.get(mat, 0) < qty:
@@ -84,6 +139,17 @@ class SupplierAgent(FactoryAgent):
                             break
 
                     if not has_stock:
+                        # Primeira vez que falta stock → entrar em recharging
+                        if not agent.recharging:
+                            agent.recharging = True
+                            agent.recharge_start_tick = current_tick
+                            await agent.log(
+                                f"[SUPPLIER/{agent.agent_name}] Stock insuficiente. "
+                                f"Inicia período de recharging por "
+                                f"{agent.recharge_duration_ticks} ticks "
+                                f"(tick_inicio={agent.recharge_start_tick})."
+                            )
+
                         rep = Message(to=str(msg.sender))
                         rep.set_metadata("protocol", "supply-cnp")
                         rep.set_metadata("performative", "refuse")
@@ -119,7 +185,8 @@ class SupplierAgent(FactoryAgent):
 
                     await agent.log(
                         f"[SUPPLIER/{agent.agent_name}] PROPOSE para {msg.sender}: "
-                        f"cost={cost:.2f}, dist={distance:.2f}, materials={requested}"
+                        f"cost={cost:.2f}, dist={distance:.2f}, materials={requested}, "
+                        f"stock_atual={agent.stock}"
                     )
                     return
 
@@ -143,7 +210,8 @@ class SupplierAgent(FactoryAgent):
 
                     await agent.log(
                         f"[SUPPLIER/{agent.agent_name}] ACCEPT-PROPOSAL de {machine_jid}. "
-                        f"Materiais reservados={requested}. Lançando CNP-Transporte..."
+                        f"Materiais reservados={requested}. Lançando CNP-Transporte... "
+                        f"Stock após reserva={agent.stock}"
                     )
 
                     # Lançar CNP-Transporte para robots
@@ -156,7 +224,7 @@ class SupplierAgent(FactoryAgent):
                         return
 
                     transport_payload = {
-                        "kind":"materials", 
+                        "kind": "materials",
                         "supplier_pos": list(agent.position),
                         "machine_pos": list(machine_pos),
                         "materials": requested,
@@ -231,7 +299,7 @@ class SupplierAgent(FactoryAgent):
                     acc.body = json.dumps(transport_payload)
                     await self.send(acc)
 
-                    # A PARTIR DAQUI, QUEM CONTINUA O FLUXO É O RAMO 'transport-cnp' / INFORM
+                    # A partir daqui o fluxo continua no ramo 'transport-cnp' / INFORM
                     return
 
                 # REJECT-PROPOSAL da máquina → só log
@@ -280,3 +348,4 @@ class SupplierAgent(FactoryAgent):
                         f"Stock atual={agent.stock}"
                     )
                     return
+

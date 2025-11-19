@@ -332,7 +332,7 @@ class MachineAgent(FactoryAgent):
 
                 await agent.log(
                     f"[JOB-DISPATCH] ACCEPT de {msg.sender}. "
-                    f"Job {job_id} enfileirado (fila={len(agent.job_queue)})."
+                    f"Job {job_id} na fila (fila={len(agent.job_queue)})."
                 )
 
                 rep = Message(to=str(msg.sender))
