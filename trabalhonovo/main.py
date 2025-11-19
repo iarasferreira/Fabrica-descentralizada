@@ -1,159 +1,168 @@
 # main.py
-# -*- coding: utf-8 -*-
-
 import asyncio
-import spade
-
-
 from environment import FactoryEnvironment
-from agents.machine_agent import MachineAgent
-from agents.supplier_agent import SupplierAgent
+from agents.supply_cnp_agent import SupplyCNPAgent
+from agents.machine_cnp_agent import MachineCNPAgent
 from agents.supervisor_agent import SupervisorAgent
-from agents.robot_agent import RobotAgent
 from agents.maintenance_agent import MaintenanceAgent
-
+from agents.robot_agent import RobotAgent
+from agents.order_agent import OrderAgent
 
 DOMAIN = "localhost"
 PWD = "12345"
 
-
 async def main():
+    print("\nMulti-Machine Coordination iniciada.\n")
+
+    # === Environment ===
     env = FactoryEnvironment()
 
-    # === Robots ===
-    robot1 = RobotAgent(
-        f"robot1@{DOMAIN}",
-        PWD,
-        env=env,
-        name="R1",
-        position=(0, 0),
-        speed=0.5,
-    )
-    robot2 = RobotAgent(
-        f"robot2@{DOMAIN}",
-        PWD,
-        env=env,
-        name="R2",
-        position=(5, 0),
-        speed=0.5,
-    )
+    env.robots = []
+
+    robot1 = RobotAgent(f"robot1@{DOMAIN}", PWD, env=env, name="R1", location=(5,5))
+    robot2 = RobotAgent(f"robot2@{DOMAIN}", PWD, env=env, name="R2", location=(6,5))
+
+    env.robots.append(robot1.jid)
+    env.robots.append(robot2.jid)
 
     await robot1.start(auto_register=True)
     await robot2.start(auto_register=True)
 
-    robots_jids = [str(robot1.jid), str(robot2.jid)]
-
-    # === Maintenance Crews ===
-    maint1 = MaintenanceAgent(
-        f"maint1@{DOMAIN}",
-        PWD,
-        env=env,
-        name="Crew-A",
-        position=(0, 5),
-        repair_time_range=(3, 7),
-    )
-    maint2 = MaintenanceAgent(
-        f"maint2@{DOMAIN}",
-        PWD,
-        env=env,
-        name="Crew-B",
-        position=(10, 5),
-        repair_time_range=(3, 7),
-    )
-
-    await maint1.start(auto_register=True)
-    await maint2.start(auto_register=True)
-
-    maintenance_jids = [str(maint1.jid), str(maint2.jid)]
-
     # === Suppliers ===
-    supplierA = SupplierAgent(
-        f"supplierA@{DOMAIN}",
-        PWD,
-        env=env,
+    supplierA = SupplyCNPAgent(
+        f"supplierA@{DOMAIN}", PWD, env=env,
         name="A",
-        stock_init={"material_1": 40, "material_2": 40},
-        position=(0, 0),
-        robots=robots_jids,
+        stock_init={"flour": 60, "sugar": 40, "butter": 30},
+        capacity={"flour": 50, "sugar": 30, "butter": 20},
+        location=(0,10)
     )
-    supplierB = SupplierAgent(
-        f"supplierB@{DOMAIN}",
-        PWD,
-        env=env,
+    supplierB = SupplyCNPAgent(
+        f"supplierB@{DOMAIN}", PWD, env=env,
         name="B",
-        stock_init={"material_1": 40, "material_2": 40},
-        position=(10, 0),
-        robots=robots_jids,
+        stock_init={"flour": 45, "sugar": 50, "butter": 25},
+        capacity={"flour": 50, "sugar": 30, "butter": 20},
+        location=(10,10)
     )
-
     await supplierA.start(auto_register=True)
     await supplierB.start(auto_register=True)
 
-    suppliers_jids = [str(supplierA.jid), str(supplierB.jid)]
+    # === Maintenance Crews (Contract Net Pattern) ===
+    # Múltiplas maintenance crews que licitar para reparações
+    maintenance_crew1 = MaintenanceAgent(
+        f"maintenance1@{DOMAIN}", PWD, env=env,
+        name="Crew-A",
+        crew_status="available",
+        repair_time_range=(3, 8),
+        location=(0, 0)
+    )
+    maintenance_crew2 = MaintenanceAgent(
+        f"maintenance2@{DOMAIN}", PWD, env=env,
+        name="Crew-B",
+        crew_status="available",
+        repair_time_range=(4, 7),
+        location=(10, 0),
+    )
+    
+    await maintenance_crew1.start(auto_register=True)
+    await maintenance_crew2.start(auto_register=True)
+    
+    # Registar maintenance crews no environment
+    env.maintenance_crews = [maintenance_crew1, maintenance_crew2]
 
     # === Machines ===
-    machine1 = MachineAgent(
-        f"machine1@{DOMAIN}",
-        PWD,
-        env=env,
+    suppliers = [f"supplierA@{DOMAIN}", f"supplierB@{DOMAIN}"]
+
+    machine1 = MachineCNPAgent(
+        f"machine1@{DOMAIN}", PWD, env=env,
+        suppliers=suppliers,
+        batch={"flour": 10, "sugar": 5, "butter": 3},
         name="M1",
-        position=(3, 0),
-        suppliers=suppliers_jids,
-        material_requirements={"material_1": 10, "material_2": 5},
         failure_rate=0.05,
-        maintenance_crews=maintenance_jids,
-        robots=robots_jids,
+        capabilities=["cutting", "mixing", "baking"],
+        location=(3,3)
     )
-    machine2 = MachineAgent(
-        f"machine2@{DOMAIN}",
-        PWD,
-        env=env,
+    machine2 = MachineCNPAgent(
+        f"machine2@{DOMAIN}", PWD, env=env,
+        suppliers=suppliers,
+        batch={"flour": 8, "sugar": 4, "butter": 2},
         name="M2",
-        position=(7, 0),
-        suppliers=suppliers_jids,
-        material_requirements={"material_1": 8, "material_2": 4},
         failure_rate=0.04,
-        maintenance_crews=maintenance_jids,
-        robots=robots_jids,
+        capabilities=["mixing", "baking", "packaging"],
+        location=(7,3)
     )
 
     await machine1.start(auto_register=True)
     await machine2.start(auto_register=True)
 
-    machines_jids = [str(machine1.jid), str(machine2.jid)]
+    # Lista de máquinas para o scheduler
+    machines = [machine1, machine2]
+
+    # === Order Agent (Novo Scheduler Descentralizado) === <--- ADICIONADO
+    order_agent = OrderAgent(
+        f"order@{DOMAIN}", PWD, env=env,
+        job_dispatch_every=5,  # dispara novo job a cada 5 ticks
+        machines=machines,     # passa referência às máquinas (para CNP Aberto)
+        location=(5, 10)       # Localização do Order Agent
+    )
+    await order_agent.start(auto_register=True)
 
     # === Supervisor ===
     supervisor = SupervisorAgent(
-        f"supervisor@{DOMAIN}",
-        PWD,
-        env=env,
-        machines=machines_jids,
-        job_dispatch_every=5,
+        f"supervisor@{DOMAIN}", PWD, env=env,
+        supply_refill_every=10,
+        refill_amount={"flour": 30, "sugar": 20, "butter": 10},
+        supply_agent_ref=supplierA,
+        location=(5,0)
     )
     await supervisor.start(auto_register=True)
 
-    # === Loop de simulação ===
+
+    # === Simulation Loop ===
     MAX_TICKS = 500
+    idle_ticks = 0
+
     while env.time < MAX_TICKS:
+        # avança o tempo global
         await env.tick()
+
+        # há algum job ainda a ser processado ou em fila?
+        active_jobs = any(
+            (m.current_job is not None) or (len(m.job_queue) > 0)
+            for m in machines
+        )
+
+        # critério de "inatividade":
+        # - não há CNP pendentes (cnp_cfp == cnp_accepts)
+        # - E não há jobs em processamento
+        if env.metrics["cnp_cfp"] == env.metrics["cnp_accepts"] and not active_jobs:
+            idle_ticks += 1
+        else:
+            idle_ticks = 0
+
+        if idle_ticks >= 10:
+            print("Nenhum novo contrato nem jobs ativos nos últimos 10 ticks. Terminando simulação.")
+            break
+
         await asyncio.sleep(0.1)
 
+    print("Execução terminada (Multi-Machine CNP + Pipeline + Manutenção).")
+
+    # === Mostrar métricas finais (útil para relatório) ===
     print("\n=== MÉTRICAS FINAIS ===")
     for k, v in env.metrics.items():
         print(f"{k}: {v}")
 
-    # parar agentes
-    await supervisor.stop()
+    # === Stop Agents ===
+    await robot1.stop()
+    await robot2.stop()
     await machine1.stop()
     await machine2.stop()
     await supplierA.stop()
     await supplierB.stop()
-    await robot1.stop()
-    await robot2.stop()
-    await maint1.stop()
-    await maint2.stop()
-
+    await maintenance_crew1.stop()
+    await maintenance_crew2.stop()
+    await supervisor.stop()
+    await order_agent.stop()
 
 if __name__ == "__main__":
-    spade.run(main(), embedded_xmpp_server=True)
-
+    asyncio.run(main())
