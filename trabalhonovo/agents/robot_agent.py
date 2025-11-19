@@ -1,6 +1,3 @@
-# agents/robot_agent.py
-# -*- coding: utf-8 -*-
-
 from agents.base_agent import FactoryAgent
 from spade.behaviour import CyclicBehaviour
 from spade.message import Message
@@ -11,31 +8,47 @@ import math
 
 
 def euclidean_distance(p1, p2):
+    """Calcula a distância euclidiana entre dois pontos 2D.
+
+    Args:
+        p1 (Sequence[float]): Ponto inicial, como tuplo ou lista ``(x1, y1)``.
+        p2 (Sequence[float]): Ponto final, como tuplo ou lista ``(x2, y2)``.
+
+    Returns:
+        float: Distância euclidiana entre `p1` e `p2`.
+    """
     dx = p2[0] - p1[0]
     dy = p2[1] - p1[1]
     return math.sqrt(dx * dx + dy * dy)
 
 
 class RobotAgent(FactoryAgent):
-    """
-    Robot de transporte genérico.
+    """Robot de transporte com gestão de energia, responsável por transportar:
 
-    - Protocolo único 'transport-cnp':
-      * CFP: payload com:
-          kind: "materials" ou "job"
-          origin_pos / supplier_pos
-          dest_pos / machine_pos
-          (opcional) materials
-          (opcional) job + destination_jid
-      * PROPOSE: responde com cost calculado a partir da distância
-      * ACCEPT-PROPOSAL: executa o transporte, consome energia
-      * INFORM: devolve 'status=delivered' ao iniciador
+    - Materiais (dos suppliers para as máquinas).
+    - Jobs (entre máquinas).
 
-    - Energia:
-      * energy ∈ [0, 100]
-      * cada transporte consome energia proporcional à distância
-      * se não tiver energia suficiente → REFUSE ("low_energy")
-      * quando está livre, recarrega automaticamente até 100
+    O robot participa no protocolo ``"transport-cnp"``:
+
+    A coordenação é feita via um protocolo CNP único, ``"transport-cnp"``,
+em que o robot:
+
+    1. Recebe CFP com a descrição do transporte (tipo, origem, destino, etc.).
+    2. Se tiver energia suficiente e estiver livre, responde com PROPOSE,
+    indicando custo, distância e energia necessária.
+    3. Caso contrário, responde com REFUSE (por exemplo, ``"busy"``
+    ou ``"low_energy"``).
+    4. Quando recebe ACCEPT-PROPOSAL, executa o transporte:
+    - Atualiza energia.
+    - Simula tempo de viagem.
+    - Atualiza a sua posição.
+    - Envia INFORM com ``status="delivered"`` ao iniciador.
+    5. Para jobs, pode ainda notificar a máquina de destino com o próprio job
+    via protocolo ``"job-transfer"``.
+
+    Inclui ainda um modelo simples de energia com recarga automática
+    quando o robot está ocioso.
+
     """
 
     def __init__(
@@ -45,19 +58,35 @@ class RobotAgent(FactoryAgent):
         env=None,
         name="Robot",
         position=(0, 0),
-        speed=1.0,          # fator p/ tempo de viagem
+        speed=1.0,
         max_energy=100,
-        recharge_rate=5,    # % por tick quando livre
+        recharge_rate=5,
         energy_per_unit=1.0,
         low_energy_threshold=5,
     ):
+        """Inicializa o agente robot de transporte.
+
+        Args:
+            jid (str): JID XMPP do agente.
+            password (str): Password associada ao JID.
+            env: Ambiente/simulador partilhado, caso exista.
+            name (str): Nome lógico do robot para efeitos de log.
+            position (tuple[float, float]): Posição inicial do robot.
+            speed (float): Fator utilizado para determinar o tempo de viagem
+                a partir da distância total (``travel_time = dist * speed``).
+            max_energy (int): Energia máxima do robot.
+            recharge_rate (int): Percentagem de energia recarregada por tick
+                quando o robot está ocioso.
+            energy_per_unit (float): Energia consumida por unidade de distância.
+            low_energy_threshold (int): Limiar abaixo do qual o robot tende
+                a recusar novos transportes (por segurança).
+        """
         super().__init__(jid, password, env=env)
         self.agent_name = name
         self.position = tuple(position)
 
         self.speed = speed
 
-        # energia
         self.max_energy = max_energy
         self.energy = max_energy
         self.recharge_rate = recharge_rate
@@ -67,6 +96,16 @@ class RobotAgent(FactoryAgent):
         self.busy = False
 
     async def setup(self):
+        """Configura o robot após o arranque.
+
+        Este método:
+
+        1. Chama o `setup` base (:class:`FactoryAgent`).
+        2. Regista no log a posição inicial e a energia atual.
+        3. Adiciona o comportamento :class:`TransportManagerBehaviour`,
+           responsável pela recarga de energia, negociação CNP e execução
+           dos transportes.
+        """
         await super().setup()
         await self.log(
             f"[ROBOT] {self.agent_name} pronto. "
@@ -75,19 +114,41 @@ class RobotAgent(FactoryAgent):
         self.add_behaviour(self.TransportManagerBehaviour())
 
     class TransportManagerBehaviour(CyclicBehaviour):
+        """Comportamento principal do robot para gestão de transportes.
+
+        Responsabilidades:
+
+       
+        - Receber mensagens do protocolo ``"transport-cnp"``.
+        - Para CFP:
+            * Verificar se o robot está livre e se tem energia suficiente.
+            * Calcular distância e energia necessária.
+            * Responder com PROPOSE ou REFUSE.
+        - Para ACCEPT-PROPOSAL:
+            * Executar o transporte (simulação de viagem).
+            * Atualizar energia e posição.
+            * Enviar INFORM com ``status="delivered"``.
+            * No caso de jobs, notificar também a máquina de destino
+              via protocolo ``"job-transfer"``.
+        - Para REJECT-PROPOSAL:
+            * Apenas regista a rejeição no log.
+        """
+
         async def run(self):
+            """Executa um ciclo de gestão de energia e processamento de mensagens.
+
+            Em cada iteração:
+
+            
+            1. Tenta receber uma mensagem com pequeno timeout.
+            2. Se a mensagem pertencer ao protocolo ``"transport-cnp"``,
+               processa-a de acordo com o seu `performative`:
+                - ``"cfp"`` → devolve PROPOSE ou REFUSE.
+                - ``"accept-proposal"`` → executa o transporte.
+                - ``"reject-proposal"`` → apenas log.
+            """
             agent = self.agent
 
-            # Recarregar se estiver livre e não a 100%
-            if not agent.busy and agent.energy < agent.max_energy:
-                prev = agent.energy
-                agent.energy = min(
-                    agent.max_energy, agent.energy + agent.recharge_rate
-                )
-                if agent.energy != prev:
-                    await agent.log(
-                        f"[ENERGY] a recarregar: {prev}% → {agent.energy}%"
-                    )
 
             msg = await self.receive(timeout=0.3)
             if not msg:
@@ -107,11 +168,10 @@ class RobotAgent(FactoryAgent):
 
             kind = task.get("kind", "materials")
 
-            # Determinar origem/destino para cálculo de distância
             if kind == "materials":
                 origin = task.get("supplier_pos", [0, 0])
                 dest = task.get("machine_pos", [0, 0])
-            else:  # "job"
+            else:
                 origin = task.get("origin_pos", [0, 0])
                 dest = task.get("dest_pos", [0, 0])
 
@@ -122,7 +182,6 @@ class RobotAgent(FactoryAgent):
                 1, int(math.ceil(total_dist * agent.energy_per_unit))
             )
 
-            # CFP → PROPOSE / REFUSE
             if pf == "cfp":
                 if agent.busy:
                     rep = Message(to=str(msg.sender))
@@ -134,7 +193,6 @@ class RobotAgent(FactoryAgent):
                     return
 
                 if agent.energy < energy_needed or agent.energy <= agent.low_energy_threshold:
-                    # Sem energia → recusa e continua a recarregar
                     rep = Message(to=str(msg.sender))
                     rep.set_metadata("protocol", "transport-cnp")
                     rep.set_metadata("performative", "refuse")
@@ -148,7 +206,6 @@ class RobotAgent(FactoryAgent):
                     )
                     return
 
-                # custo: distância + termo opcional com quantidade de materiais
                 total_qty = 0
                 if kind == "materials":
                     total_qty = sum(task.get("materials", {}).values())
@@ -175,17 +232,14 @@ class RobotAgent(FactoryAgent):
                 )
                 return
 
-            # ACCEPT-PROPOSAL → executar transporte
             if pf == "accept-proposal":
                 agent.busy = True
 
-                # Segurança: recalcular energy_needed
                 if agent.energy < energy_needed:
                     await agent.log(
                         f"[ROBOT] ERRO: energy insuficiente na hora do ACCEPT "
                         f"(energy={agent.energy}%, needed={energy_needed}%)."
                     )
-                    # Falha "tardia": envia REFUSE de fallback
                     rep = Message(to=str(msg.sender))
                     rep.set_metadata("protocol", "transport-cnp")
                     rep.set_metadata("performative", "refuse")
@@ -195,7 +249,6 @@ class RobotAgent(FactoryAgent):
                     agent.busy = False
                     return
 
-                # Consome energia
                 prev_e = agent.energy
                 agent.energy = max(0, agent.energy - energy_needed)
 
@@ -208,10 +261,8 @@ class RobotAgent(FactoryAgent):
                 travel_time = max(0.5, total_dist * agent.speed)
                 await asyncio.sleep(travel_time)
 
-                # Atualizar posição para o destino final
                 agent.position = tuple(dest)
 
-                # INFORM para o iniciador (supplier ou máquina)
                 inf = Message(to=str(msg.sender))
                 inf.set_metadata("protocol", "transport-cnp")
                 inf.set_metadata("performative", "inform")
@@ -219,7 +270,6 @@ class RobotAgent(FactoryAgent):
                 inf.body = json.dumps({"status": "delivered", "kind": kind})
                 await self.send(inf)
 
-                # Se for job, também notifica a máquina destino com o próprio job
                 if kind == "job":
                     job = task.get("job", {})
                     dest_jid = task.get("destination_jid")
@@ -247,7 +297,6 @@ class RobotAgent(FactoryAgent):
                 agent.busy = False
                 return
 
-            # REJECT-PROPOSAL → apenas log
             if pf == "reject-proposal":
                 await agent.log(
                     f"[ROBOT] REJECT recebido de {msg.sender} "

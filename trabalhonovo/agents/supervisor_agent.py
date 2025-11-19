@@ -1,6 +1,3 @@
-# agents/supervisor_agent.py
-# -*- coding: utf-8 -*-
-
 import asyncio
 import json
 import random
@@ -11,6 +8,17 @@ from spade.message import Message
 
 
 class SupervisorAgent(FactoryAgent):
+    """Agente supervisor responsável pelo agendamento e atribuição de jobs.
+
+    Este agente é responsável por criar jobs periodicamente e coordenar um
+    leilão/negociação com as máquinas disponíveis usando um protocolo Contract Net Protocol (CNP). Cada job é enviado como CFP
+    para todas as máquinas registadas, que podem propor um custo ou recusar
+    o job. O supervisor escolhe a proposta com menor custo (desempate aleatório em caso de empate). 
+    Envia ``accept-proposal`` para a máquina vencedora e ``reject-proposal``
+    para as restantes.
+    
+    """
+
     def __init__(
         self,
         jid,
@@ -19,13 +27,34 @@ class SupervisorAgent(FactoryAgent):
         machines=None,
         job_dispatch_every=5,
     ):
+        """Inicializa o agente supervisor.
+
+        Args:
+            jid (str): JID XMPP do agente.
+            password (str): Password associada ao JID.
+            env: Referência ao ambiente/simulador partilhado, usado para obter
+                o tempo atual (ticks) e registar métricas globais.
+            machines (list[str] | None): Lista de JIDs das máquinas que irão
+                receber CFPs. Se ``None``, é usada uma lista vazia.
+            job_dispatch_every (int): Número de ticks entre despachos sucessivos
+                de novos jobs.
+        """
         super().__init__(jid, password, env=env)
-        self.machines = machines or []      # lista de JIDs (strings)
+        self.machines = machines or []
         self.job_dispatch_every = job_dispatch_every
         self.last_dispatch_time = 0
         self.job_counter = 0
 
     async def setup(self):
+        """Configura o agente supervisor após o arranque.
+
+        Este método:
+
+        1. Regista o agente no ambiente, (via :class:`FactoryAgent`).
+        2. Escreve uma mensagem de log com a configuração atual.
+        3. Adiciona o comportamento :class:`JobDispatcher` responsável por
+           criar e despachar jobs ciclicamente.
+        """
         await super().setup()
         await self.log(
             f"Supervisor pronto. job_dispatch_every={self.job_dispatch_every}, "
@@ -34,12 +63,71 @@ class SupervisorAgent(FactoryAgent):
         self.add_behaviour(self.JobDispatcher())
 
     class JobDispatcher(CyclicBehaviour):
+        """Comportamento cíclico responsável por criar e negociar jobs.
+
+        Em cada execução do ciclo, este comportamento:
+
+        1. Verifica o tempo atual do ambiente.
+        2. Se tiver passado pelo menos ``job_dispatch_every`` ticks desde o
+           último job, cria um novo job com uma duração aleatória.
+        3. Envia uma CFP (*Call For Proposals*) para todas as máquinas registadas.
+        4. Aguarda respostas (``propose`` ou ``refuse``) durante uma janela
+           de tempo limitada.
+        5. Seleciona a proposta de menor custo e envia:
+           - ``accept-proposal`` à máquina vencedora;
+           - ``reject-proposal`` às restantes máquinas que propuseram.
+        """
+
         async def run(self):
+            """Executa um ciclo de despacho e negociação de jobs.
+
+            Este método é chamado repetidamente pelo motor de comportamentos
+            do SPADE. Em cada iteração pode ou não ser criado um novo job,
+            dependendo do tempo decorrido desde o último despacho.
+
+            Protocolo de mensagens:
+                - CFP:
+                    * metadata:
+                        - ``protocol`` = ``"job-dispatch"``
+                        - ``performative`` = ``"cfp"``
+                        - ``thread`` = ID único para o job
+                    * body (JSON):
+                        - ``job_id`` (int)
+                        - ``duration`` (int)
+                - PROPOSE:
+                    * metadata:
+                        - ``protocol`` = ``"job-dispatch"``
+                        - ``performative`` = ``"propose"``
+                        - ``thread`` = mesmo ID do job
+                    * body (JSON):
+                        - ``cost`` (numérico): custo reportado pela máquina.
+                - REFUSE:
+                    * metadata:
+                        - ``protocol`` = ``"job-dispatch"``
+                        - ``performative`` = ``"refuse"``
+                        - ``thread`` = mesmo ID do job
+                    * body (JSON, opcional):
+                        - ``reason`` (str): motivo da recusa.
+                - ACCEPT-PROPOSAL / REJECT-PROPOSAL:
+                    * metadata:
+                        - ``protocol`` = ``"job-dispatch"``
+                        - ``performative`` = ``"accept-proposal"`` ou
+                          ``"reject-proposal"``
+                        - ``thread`` = mesmo ID do job
+                    * body:
+                        - No caso de ``accept-proposal``: especificação do job.
+                        - No caso de ``reject-proposal``: motivo da rejeição.
+
+            Side Effects:
+                - Atualiza ``env.metrics["jobs_created"]``.
+                - Escreve mensagens de log com o estado do leilão e decisões
+                  de seleção de máquinas.
+
+            """
             agent = self.agent
             env = agent.env
             t = env.time
 
-            # de N em N ticks lança um novo job
             if t > 0 and (t - agent.last_dispatch_time) >= agent.job_dispatch_every:
                 agent.last_dispatch_time = t
                 agent.job_counter += 1
@@ -52,7 +140,6 @@ class SupervisorAgent(FactoryAgent):
 
                 thread_id = f"job-dispatch-{job_id}-{t}"
 
-                # Enviar CFP para todas as máquinas
                 for m_jid in agent.machines:
                     msg = Message(to=m_jid)
                     msg.set_metadata("protocol", "job-dispatch")
@@ -69,9 +156,8 @@ class SupervisorAgent(FactoryAgent):
                 if env:
                     env.metrics["jobs_created"] += 1
 
-                # Recolher PROPOSE / REFUSE
                 proposals = []
-                deadline = asyncio.get_event_loop().time() + 3  # 3s para respostas
+                deadline = asyncio.get_event_loop().time() + 3
 
                 while asyncio.get_event_loop().time() < deadline:
                     rep = await self.receive(timeout=0.5)
@@ -105,7 +191,6 @@ class SupervisorAgent(FactoryAgent):
                     await asyncio.sleep(0.5)
                     return
 
-                # Escolher máquina com menor custo (tie-break aleatório)
                 min_cost = min(cost for _, cost in proposals)
                 best_candidates = [
                     (jid, cost) for jid, cost in proposals if cost == min_cost
@@ -117,7 +202,6 @@ class SupervisorAgent(FactoryAgent):
                     f"{winner_jid} (cost={winner_cost}, candidatos={proposals})"
                 )
 
-                # Enviar ACCEPT ao vencedor e REJECT aos outros
                 for jid, _ in proposals:
                     if jid == winner_jid:
                         acc = Message(to=jid)

@@ -1,6 +1,3 @@
-# agents/supplier_agent.py
-# -*- coding: utf-8 -*-
-
 from agents.base_agent import FactoryAgent
 from spade.behaviour import CyclicBehaviour
 from spade.message import Message
@@ -11,17 +8,47 @@ import time
 
 
 class SupplierAgent(FactoryAgent):
-    """
-    Supplier que participa no CNP de materiais com as máquinas (supply-cnp)
-    e delega o transporte em robots (transport-cnp).
+    """Agente fornecedor de materiais (Supplier).
 
-    Comportamento de stock:
-    - Inicia com 40 unidades por material (se não for passado stock_init).
-    - Quando rejeita pela primeira vez um pedido por falta de material:
-        * entra em estado "recharging" (parado);
-        * fica 5 ticks sem aceitar pedidos;
-        * ao fim de 5 ticks faz restock para 40 unidades por material;
-        * sai de "recharging" e volta a responder normalmente.
+    O supplier participa num CNP de recursos com as máquinas
+    (protocolo ``"supply-cnp"``) e delega o transporte em robots
+    (protocolo ``"transport-cnp"``):
+
+    - ``"supply-cnp"`` (Máquina - Supplier):
+        * CFP:
+            - A máquina envia pedido de materiais e posição.
+            - O supplier verifica stock e estado (recharging ou não).
+            - Se puder fornecer, responde com PROPOSE (custo, distância,
+              materiais que consegue fornecer).
+            - Caso contrário, responde REFUSE (``"no_stock"`` ou
+              ``"recharging"``).
+        * ACCEPT-PROPOSAL:
+            - Reserva stock.
+            - Inicia um CNP de transporte com robots (``"transport-cnp"``).
+        * REJECT-PROPOSAL:
+            - Apenas regista em log.
+        * INFORM (vindo do supplier para a máquina):
+            - Indica que os materiais foram entregues.
+
+    - ``"transport-cnp"`` (Supplier - Robots):
+        * O supplier atua como iniciador, enviando CFP para todos os robots.
+        * Recolhe PROPOSE/REFUSE dos robots.
+        * Escolhe o robot com menor custo e envia ACCEPT-PROPOSAL.
+        * Quando recebe INFORM do robot vencedor, reencaminha INFORM final
+          para a máquina, indicando que os materiais chegaram.
+
+    Gestão de stock e recharging:
+
+    - Mantém `max_stock_per_material` como valor máximo.
+    - Quando detecta falta de stock num pedido:
+        * Muda para estado `recharging`.
+        * Regista o tick de início (`recharge_start_tick`).
+        * Durante `recharge_duration_ticks` recusa todos os pedidos
+          (REFUSE ``"recharging"``).
+        * Ao fim desse período, repõe stock para o máximo em todos os
+          materiais e volta a aceitar pedidos.
+
+
     """
 
     def __init__(
@@ -32,35 +59,55 @@ class SupplierAgent(FactoryAgent):
         name="Supplier",
         stock_init=None,
         position=(0, 0),
-        robots=None,     # lista de JIDs de robots
+        robots=None,
     ):
+        """Inicializa o agente supplier.
+
+        Args:
+            jid (str): JID XMPP do agente.
+            password (str): Password associada ao JID.
+            env: Ambiente/simulador partilhado, usado para obter o tempo
+                em ticks e, se necessário, registar métricas.
+            name (str): Nome lógico do supplier para efeitos de log.
+            stock_init (dict[str, int] | None): Stock inicial por material.
+                Se ``None``, é usado o stock máximo (`max_stock_per_material`)
+                para os materiais padrão (``"material_1"`` e
+                ``"material_2"``).
+            position (tuple[float, float]): Posição (x, y) do supplier.
+            robots (list[str] | None): Lista de JIDs de robots que podem
+                executar transportes para este supplier. Se ``None``,
+                é usada uma lista vazia.
+        """
         super().__init__(jid, password, env=env)
         self.agent_name = name
         self.position = position
 
-        # === Gestão de stock ===
         self.max_stock_per_material = 40
 
-        # Se não vier stock_init, começamos com 40 de cada material
         self.stock = stock_init or {
             "material_1": self.max_stock_per_material,
             "material_2": self.max_stock_per_material,
         }
 
-        # Estado de "recharging" (paragem para restock)
         self.recharging = False
         self.recharge_start_tick = None
-        self.recharge_duration_ticks = 5  # pára 5 ticks antes de fazer restock
+        self.recharge_duration_ticks = 5
 
-        # Robots disponíveis
         self.robots = robots or []
 
-        # Guardar info das entregas pendentes:
-        #   key: thread_id (supply-cnp)
-        #   value: {"machine_jid": str, "materials": dict}
         self.pending_deliveries = {}
 
     async def setup(self):
+        """Configura o supplier após o arranque.
+
+        Este método:
+
+        1. Chama o `setup` base (:class:`FactoryAgent`).
+        2. Regista em log o stock inicial, a posição e a lista de robots.
+        3. Adiciona o comportamento :class:`CNPBehaviour`, que trata tanto
+           do CNP de recursos (``"supply-cnp"``) como do CNP de transporte
+           (``"transport-cnp"`` do lado do supplier).
+        """
         await super().setup()
         await self.log(
             f"(Supplier {self.agent_name}) stock={self.stock}, pos={self.position}, "
@@ -69,7 +116,61 @@ class SupplierAgent(FactoryAgent):
         self.add_behaviour(self.CNPBehaviour())
 
     class CNPBehaviour(CyclicBehaviour):
+        """Comportamento CNP para materiais e transporte.
+
+        Este comportamento lida com dois protocolos distintos:
+
+        1) ``"supply-cnp"`` (Máquina - Supplier):
+            - CFP:
+                * Verifica se o supplier está em recharging.
+                * Se estiver, recusa o pedido (REFUSE ``"recharging"``)
+                  até terminar o período de recharging.
+                * Se o período de recharging tiver terminado, repõe stock
+                  e volta a aceitar pedidos.
+                * Verifica se há stock suficiente para o pedido:
+                    - Se não houver, entra (ou permanece) em estado
+                      `recharging` e responde REFUSE ``"no_stock"``.
+                    - Se houver, calcula custo (distância + 0.5 * quantidade
+                      total) e responde PROPOSE.
+            - ACCEPT-PROPOSAL:
+                * Debita stock (reserva os materiais).
+                * Regista a entrega pendente em `pending_deliveries`.
+                * Inicia CNP de transporte com robots (protocolo
+                  ``"transport-cnp"``).
+            - REJECT-PROPOSAL:
+                * Apenas regista em log.
+
+        2) ``"transport-cnp"`` (Supplier - Robots):
+            - INFORM:
+                * Recebido do robot ao concluir o transporte.
+                * Recupera a entrega pendente associada ao `thread_id`.
+                * Envia INFORM final para a máquina, com
+                  ``status="delivered"`` e materiais entregues.
+        """
+
         async def run(self):
+            """Processa uma mensagem CNP por iteração.
+
+            Em cada iteração:
+
+            1. Tenta receber uma mensagem com timeout de 1 segundo.
+            2. Verifica o protocolo:
+                - ``"supply-cnp"`` - trata CFP/ACCEPT/REJECT de pedidos de materiais.
+                - ``"transport-cnp"`` - trata INFORM de robots (entrega concluída).
+            3. Para ``"supply-cnp"``:
+                - Em CFP:
+                    * Aplica a lógica de recharging e verificação de stock.
+                    * Devolve PROPOSE ou REFUSE.
+                - Em ACCEPT-PROPOSAL:
+                    * Reserva stock, regista entrega pendente e inicia CNP
+                      de transporte com robots.
+                - Em REJECT-PROPOSAL:
+                    * Apenas escreve log.
+            4. Para ``"transport-cnp"``:
+                - Em INFORM:
+                    * Conclui a entrega pendente e envia INFORM final para
+                      a máquina.
+            """
             agent = self.agent
             msg = await self.receive(timeout=1)
             if not msg:
@@ -79,32 +180,25 @@ class SupplierAgent(FactoryAgent):
             pf = msg.metadata.get("performative")
             thread_id = msg.metadata.get("thread")
 
-            # ======================================================
-            # 1) CNP-RECURSOS: protocolo 'supply-cnp' (Máquina ↔ Supplier)
-            # ======================================================
             if protocol == "supply-cnp":
                 try:
                     data = json.loads(msg.body) if msg.body else {}
                 except Exception:
                     data = {}
 
-                # CFP → decide PROPOSE / REFUSE
                 if pf == "cfp":
                     requested = data.get("materials", {})
                     machine_pos = data.get("machine_pos", [0, 0])
 
-                    # --- Gestão do estado de "recharging" ---
                     current_tick = agent.env.time if agent.env else None
 
                     if agent.recharging:
-                        # Verificar se já passaram os 5 ticks de paragem
                         if (
                             current_tick is not None
                             and agent.recharge_start_tick is not None
                             and current_tick - agent.recharge_start_tick
                             >= agent.recharge_duration_ticks
                         ):
-                            # Conclui restock: repõe stock para 40 por material
                             for mat in agent.stock.keys():
                                 agent.stock[mat] = agent.max_stock_per_material
 
@@ -115,9 +209,7 @@ class SupplierAgent(FactoryAgent):
                                 f"[SUPPLIER/{agent.agent_name}] Restock concluído. "
                                 f"Stock reposto para {agent.stock}."
                             )
-                            # Depois disto, continua a tratar CFP normalmente.
                         else:
-                            # Ainda a recarregar → recusa todos os CFP
                             rep = Message(to=str(msg.sender))
                             rep.set_metadata("protocol", "supply-cnp")
                             rep.set_metadata("performative", "refuse")
@@ -131,7 +223,6 @@ class SupplierAgent(FactoryAgent):
                             )
                             return
 
-                    # --- Verificar stock suficiente ---
                     has_stock = True
                     for mat, qty in requested.items():
                         if agent.stock.get(mat, 0) < qty:
@@ -139,7 +230,6 @@ class SupplierAgent(FactoryAgent):
                             break
 
                     if not has_stock:
-                        # Primeira vez que falta stock → entrar em recharging
                         if not agent.recharging:
                             agent.recharging = True
                             agent.recharge_start_tick = current_tick
@@ -163,7 +253,6 @@ class SupplierAgent(FactoryAgent):
                         )
                         return
 
-                    # custo = distância + 0.5 * quantidade total
                     dx = machine_pos[0] - agent.position[0]
                     dy = machine_pos[1] - agent.position[1]
                     distance = math.sqrt(dx * dx + dy * dy)
@@ -190,19 +279,16 @@ class SupplierAgent(FactoryAgent):
                     )
                     return
 
-                # ACCEPT-PROPOSAL → lançar CNP-Transporte com robots
                 if pf == "accept-proposal":
                     requested = data.get("materials", {})
                     machine_pos = data.get("machine_pos", [0, 0])
 
-                    # Reservar stock (debitamos já)
                     for mat, qty in requested.items():
                         agent.stock[mat] = max(0, agent.stock.get(mat, 0) - qty)
 
                     machine_jid = str(msg.sender)
                     safe_thread = thread_id
 
-                    # Guardar info desta entrega pendente
                     agent.pending_deliveries[safe_thread] = {
                         "machine_jid": machine_jid,
                         "materials": requested,
@@ -214,13 +300,11 @@ class SupplierAgent(FactoryAgent):
                         f"Stock após reserva={agent.stock}"
                     )
 
-                    # Lançar CNP-Transporte para robots
                     if not agent.robots:
                         await agent.log(
                             "[SUPPLIER] ERRO: não há robots configurados. "
                             "Não é possível entregar materiais."
                         )
-                        # Poderias aqui marcar falha e devolver stock, se quiseres
                         return
 
                     transport_payload = {
@@ -231,7 +315,6 @@ class SupplierAgent(FactoryAgent):
                         "initiator_jid": str(agent.jid),
                     }
 
-                    # Enviar CFP a todos os robots
                     for r_jid in agent.robots:
                         m = Message(to=r_jid)
                         m.set_metadata("protocol", "transport-cnp")
@@ -240,9 +323,8 @@ class SupplierAgent(FactoryAgent):
                         m.body = json.dumps(transport_payload)
                         await self.send(m)
 
-                    # Recolher PROPOSE dos robots
                     proposals = []
-                    deadline = time.time() + 3  # 3 s
+                    deadline = time.time() + 3
 
                     while time.time() < deadline:
                         rep = await self.receive(timeout=0.5)
@@ -270,10 +352,8 @@ class SupplierAgent(FactoryAgent):
                         await agent.log(
                             f"[SUPPLIER] Nenhum robot aceitou transportar (thread={safe_thread})."
                         )
-                        # Opcional: devolver stock, notificar máquina de falha, etc.
                         return
 
-                    # Escolher robot com menor custo
                     proposals.sort(key=lambda x: x[1])
                     winner_jid, winner_cost = proposals[0]
 
@@ -282,7 +362,6 @@ class SupplierAgent(FactoryAgent):
                         "Enviando ACCEPT-PROPOSAL (transporte)."
                     )
 
-                    # REJECT aos outros
                     for r_jid, _ in proposals[1:]:
                         rej = Message(to=r_jid)
                         rej.set_metadata("protocol", "transport-cnp")
@@ -291,7 +370,6 @@ class SupplierAgent(FactoryAgent):
                         rej.body = json.dumps({"reason": "not_selected"})
                         await self.send(rej)
 
-                    # ACCEPT ao vencedor
                     acc = Message(to=winner_jid)
                     acc.set_metadata("protocol", "transport-cnp")
                     acc.set_metadata("performative", "accept-proposal")
@@ -299,22 +377,15 @@ class SupplierAgent(FactoryAgent):
                     acc.body = json.dumps(transport_payload)
                     await self.send(acc)
 
-                    # A partir daqui o fluxo continua no ramo 'transport-cnp' / INFORM
                     return
 
-                # REJECT-PROPOSAL da máquina → só log
                 if pf == "reject-proposal":
                     await agent.log(
                         f"[SUPPLIER/{agent.agent_name}] REJECT recebido de {msg.sender}"
                     )
                     return
 
-            # ======================================================
-            # 2) CNP-TRANSPORTE: protocolo 'transport-cnp' (Supplier ↔ Robots)
-            #    Aqui tratamos o INFORM do robot quando terminar o transporte.
-            # ======================================================
             if protocol == "transport-cnp":
-                # Só precisamos de tratar INFORM (transporte concluído)
                 if pf == "inform":
                     info = agent.pending_deliveries.get(thread_id)
                     if not info:
@@ -326,10 +397,8 @@ class SupplierAgent(FactoryAgent):
                     machine_jid = info["machine_jid"]
                     materials = info["materials"]
 
-                    # Remover da lista de pendentes
                     agent.pending_deliveries.pop(thread_id, None)
 
-                    # Enviar INFORM final para a máquina (supply-cnp)
                     inf = Message(to=machine_jid)
                     inf.set_metadata("protocol", "supply-cnp")
                     inf.set_metadata("performative", "inform")
@@ -348,4 +417,3 @@ class SupplierAgent(FactoryAgent):
                         f"Stock atual={agent.stock}"
                     )
                     return
-

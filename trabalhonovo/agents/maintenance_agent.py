@@ -1,6 +1,3 @@
-# agents/maintenance_agent.py
-# -*- coding: utf-8 -*-
-
 import asyncio
 import json
 import math
@@ -12,18 +9,21 @@ from agents.base_agent import FactoryAgent
 
 
 class MaintenanceAgent(FactoryAgent):
-    """
-    Maintenance Crew:
+    """Agente de manutenção (Maintenance Crew).
 
-    - Protocolo 'maintenance-cnp' iniciado pelas máquinas que falham.
-    - Recebe CFP com info da máquina (jid, posição).
-    - Se disponível:
-        * calcula custo com base na distância + tempo de reparação
-        * responde PROPOSE
+    Este agente representa uma equipa de manutenção que responde a pedidos
+    de reparação de máquinas. Utiliza o protocolo ``maintenance-cnp``:
+
+    - Recebe CFP com informação da máquina (JID e posição).
+    - Se estiver disponível:
+        * Calcula um custo com base na distância e no tempo de reparação.
+        * Responde com PROPOSE.
     - Se for escolhida:
-        * recebe ACCEPT-PROPOSAL com repair_time
-        * simula a reparação (RepairExecutor)
-        * envia INFORM 'repair_completed' para a máquina.
+        * Recebe ACCEPT-PROPOSAL com `repair_time`.
+        * Simula a reparação durante um certo número de ticks
+          (:class:`RepairExecutor`).
+        * Envia INFORM com ``status="repair_completed"`` para a máquina.
+
     """
 
     def __init__(
@@ -35,16 +35,41 @@ class MaintenanceAgent(FactoryAgent):
         position=(0, 0),
         repair_time_range=(3, 8),
     ):
+        """Inicializa o agente de manutenção.
+
+        Args:
+            jid (str): JID XMPP do agente.
+            password (str): Password associada ao JID.
+            env: Referência ao ambiente/simulador, usada para atualizar métricas,
+                como o número de reparações concluídas.
+            name (str): Nome da equipa de manutenção para efeitos de log.
+            position (tuple[float, float]): Posição inicial (x, y) da equipa.
+            repair_time_range (tuple[int, int]): Intervalo (mín, máx) em ticks
+                para a duração de reparações.
+        """
         super().__init__(jid, password, env=env)
         self.agent_name = name
         self.position = position
         self.repair_time_range = repair_time_range
 
-        self.crew_status = "available"  # "available" | "busy"
+        self.crew_status = "available"
         self.current_repair = None
         self.repair_ticks_remaining = 0
 
     async def setup(self):
+        """Configura o agente após o arranque.
+
+        Este método:
+
+        1. Chama o setup base (:class:`FactoryAgent`) para registo no ambiente.
+        2. Escreve uma mensagem de log com a posição e estado inicial da
+           equipa de manutenção.
+        3. Adiciona dois comportamentos cíclicos:
+            - :class:`MaintenanceParticipant` para participação no CNP
+              de manutenção;
+            - :class:`RepairExecutor` para simular a execução da reparação
+              ao longo do tempo.
+        """
         await super().setup()
         await self.log(
             f"[MAINT] {self.agent_name} pronto. "
@@ -53,11 +78,73 @@ class MaintenanceAgent(FactoryAgent):
         self.add_behaviour(self.MaintenanceParticipant())
         self.add_behaviour(self.RepairExecutor())
 
-    # ----------------------------------------------------------
-    # CNP participant: responde a CFP/ACCEPT/REJECT
-    # ----------------------------------------------------------
+    
     class MaintenanceParticipant(CyclicBehaviour):
+        """Comportamento CNP para responder a pedidos de manutenção.
+
+        Este comportamento trata da parte de negociação:
+
+        - Recebe mensagens com o protocolo ``"maintenance-cnp"``.
+        - Para mensagens com performative ``"cfp"``:
+            * Se a equipa estiver disponível → calcula um custo e faz PROPOSE.
+            * Caso contrário → responde REFUSE, indicando o estado atual.
+        - Para mensagens com performative ``"accept-proposal"``:
+            * Regista a reparação atual e define o número de ticks restantes.
+            * Atualiza o estado da equipa para ``"busy"``.
+            * Opcionalmente envia um INFORM com ``"repair_started"``.
+        - Para mensagens com performative ``"reject-proposal"``:
+            * Apenas regista a rejeição no log.
+        """
+
         async def run(self):
+            """Processa uma mensagem do protocolo de manutenção.
+
+            Este método é chamado ciclicamente pelo motor de comportamentos
+            do SPADE. Em cada iteração:
+
+            1. Tenta ler uma mensagem com timeout curto.
+            2. Se não houver mensagem ou se não for do protocolo
+               ``"maintenance-cnp"``, termina a iteração.
+            3. Com base no performative (``cfp``, ``accept-proposal``,
+               ``reject-proposal``), executa a lógica correspondente descrita
+               em :class:`MaintenanceParticipant`.
+
+            Protocolo de mensagens:
+                - CFP:
+                    * metadata:
+                        - ``protocol`` = ``"maintenance-cnp"``
+                        - ``performative`` = ``"cfp"``
+                        - ``thread`` = ID do leilão/negociação
+                    * body (JSON):
+                        - ``machine_jid`` (str)
+                        - ``machine_pos`` (list[float, float])
+                - PROPOSE:
+                    * metadata:
+                        - ``protocol`` = ``"maintenance-cnp"``
+                        - ``performative`` = ``"propose"``
+                        - ``thread`` = mesmo ID da CFP
+                    * body (JSON):
+                        - ``crew`` (str): nome da equipa.
+                        - ``cost`` (float): custo estimado.
+                        - ``repair_time`` (int): duração estimada da reparação.
+                        - ``distance`` (float): distância à máquina.
+                - REFUSE:
+                    * metadata:
+                        - ``protocol`` = ``"maintenance-cnp"``
+                        - ``performative`` = ``"refuse"``
+                        - ``thread`` = mesmo ID da CFP
+                    * body (JSON, opcional):
+                        - ``reason`` (str): motivo da recusa (por ex., ``"busy"``).
+                - ACCEPT-PROPOSAL / REJECT-PROPOSAL:
+                    * metadata:
+                        - ``protocol`` = ``"maintenance-cnp"``
+                        - ``performative`` = ``"accept-proposal"`` ou
+                          ``"reject-proposal"``
+                        - ``thread`` = mesmo ID da CFP
+                    * body:
+                        - No caso de ``accept-proposal``: inclui informação
+                          da máquina e ``repair_time``.
+            """
             agent = self.agent
             msg = await self.receive(timeout=0.5)
             if not msg:
@@ -74,7 +161,6 @@ class MaintenanceAgent(FactoryAgent):
             except Exception:
                 data = {}
 
-            # CFP → decidir se faz PROPOSE ou REFUSE
             if pf == "cfp":
                 machine_jid = data.get("machine_jid")
                 machine_pos = data.get("machine_pos", [0, 0])
@@ -119,7 +205,6 @@ class MaintenanceAgent(FactoryAgent):
                 )
                 return
 
-            # ACCEPT-PROPOSAL → agendar reparação
             if pf == "accept-proposal":
                 machine_jid = data.get("machine_jid")
                 machine_pos = data.get("machine_pos", [0, 0])
@@ -138,7 +223,6 @@ class MaintenanceAgent(FactoryAgent):
                     f"Iniciar reparação ({repair_time} ticks)."
                 )
 
-                # Opcional: informar que começou
                 inf = Message(to=machine_jid)
                 inf.set_metadata("protocol", "maintenance-cnp")
                 inf.set_metadata("performative", "inform")
@@ -147,16 +231,47 @@ class MaintenanceAgent(FactoryAgent):
                 await self.send(inf)
                 return
 
-            # REJECT-PROPOSAL → só log
+            # REJECT-PROPOSAL → apenas logar
             if pf == "reject-proposal":
                 await agent.log("[MAINT-CNP] REJECT recebido.")
                 return
 
-    # ----------------------------------------------------------
-    # Executor da reparação
-    # ----------------------------------------------------------
     class RepairExecutor(CyclicBehaviour):
+        """Comportamento responsável por simular a execução da reparação.
+
+        Este comportamento:
+
+        - Verifica se existe uma reparação em curso (`current_repair`).
+        - Se não houver, marca a equipa como ``"available"`` e fica em espera.
+        - Se houver, decrementa `repair_ticks_remaining` a cada execução,
+          simulando a passagem de um tick de reparação.
+        - Quando o número de ticks chegar a zero:
+            * Envia uma mensagem INFORM com ``"repair_completed"`` para a
+              máquina correspondente.
+            * Atualiza o estado da equipa para ``"available"``.
+            * Incrementa a métrica global ``repairs_finished`` no ambiente.
+        """
+
         async def run(self):
+            """Atualiza o estado da reparação em curso.
+
+            Este método é chamado ciclicamente, representando o avanço de
+            um tick de simulação para a reparação:
+
+            - Se `current_repair` for ``None``:
+                * Marca a equipa como disponível.
+                * Aguarda um curto intervalo antes da próxima iteração.
+            - Se `current_repair` não for ``None``:
+                * Decrementa `repair_ticks_remaining`.
+                * Regista no log o número de ticks restantes.
+                * Quando `repair_ticks_remaining` chega a 0 ou menos:
+                    - Envia INFORM para a máquina com
+                      ``status="repair_completed"``.
+                    - Limpa `current_repair` e volta a marcar a equipa como
+                      disponível.
+                    - Atualiza a métrica `repairs_finished` no ambiente, se
+                      este existir.
+            """
             agent = self.agent
 
             if agent.current_repair is None:
@@ -164,7 +279,6 @@ class MaintenanceAgent(FactoryAgent):
                 await asyncio.sleep(0.5)
                 return
 
-            # avançar 1 tick de reparação
             if agent.repair_ticks_remaining > 0:
                 agent.repair_ticks_remaining -= 1
                 await agent.log(
@@ -198,6 +312,17 @@ class MaintenanceAgent(FactoryAgent):
 
 
 def random_int_in_range(rng):
-    """Helper simples para randint sem ter de importar random aqui em cima."""
+    """Gera um inteiro aleatório dentro de um intervalo.
+
+    Função auxiliar simples que devolve um número inteiro aleatório dentro
+    do intervalo dado por `rng`, usando ``random.randint``.
+
+    Args:
+        rng (tuple[int, int]): Intervalo (mín, máx) no qual gerar o número
+            inteiro aleatório.
+
+    Returns:
+        int: Número inteiro aleatório no intervalo `[rng[0], rng[1]]`.
+    """
     import random
     return random.randint(rng[0], rng[1])

@@ -1,6 +1,3 @@
-# agents/machine_agent.py
-# -*- coding: utf-8 -*-
-
 from agents.base_agent import FactoryAgent
 from spade.behaviour import CyclicBehaviour
 from spade.message import Message
@@ -11,6 +8,26 @@ import random
 
 
 class MachineAgent(FactoryAgent):
+    """Agente de máquina de produção.
+
+    Este módulo define o :class:`MachineAgent`, responsável por:
+
+    - Negociar jobs com o Supervisor via protocolo ``"job-dispatch"`` (CNP).
+    - Obter materiais de suppliers via protocolo ``"supply-cnp"`` (CNP de recursos).
+    - Executar um pipeline de produção em vários steps (step0–step3).
+    - Simular falhas com certa probabilidade e pedir manutenção às crews via
+    protocolo ``"maintenance-cnp"``.
+    - Transferir jobs para outras máquinas em caso de falha, usando:
+        * CNP de transferência entre máquinas (``"transfer-cnp"``);
+        * Robots de transporte via protocolo ``"transport-cnp"`` para levar
+        o job fisicamente até à máquina destino;
+        * Protocolo ``"job-transfer"`` do lado da máquina destino para receber
+        o job entregue pelo robot.
+
+    A máquina trabalha com uma fila de jobs (`job_queue`) e um job atual
+    (`current_job`) que percorre um pipeline de etapas com tempos fixos.
+    """
+
     def __init__(
         self,
         jid,
@@ -22,30 +39,47 @@ class MachineAgent(FactoryAgent):
         material_requirements=None,
         max_queue=15,
         failure_rate=0.10,
-        maintenance_crews=None,  # lista de JIDs das crew
-        robots=None,  # lista de JIDs dos robots
+        maintenance_crews=None,
+        robots=None,
     ):
+        """Inicializa o agente de máquina.
+
+        Args:
+            jid (str): JID XMPP do agente, por exemplo ``"machine1@localhost"``.
+            password (str): Password associada ao JID.
+            env: Ambiente/simulador partilhado, usado para:
+                - Aceder ao tempo de simulação;
+                - Registar métricas (jobs, falhas, manutenção, etc.).
+            name (str): Nome lógico da máquina para efeitos de log.
+            position (tuple[float, float]): Posição (x, y) da máquina.
+            suppliers (list[str] | None): Lista de JIDs dos suppliers.
+            material_requirements (dict[str, int] | None): Materiais
+                necessários por job. Se ``None``, assume
+                ``{"material_1": 10, "material_2": 5}``.
+            max_queue (int): Capacidade máxima da fila de jobs.
+            failure_rate (float): Probabilidade de falha por tick em etapas
+                de processamento (step1/2/3).
+            maintenance_crews (list[str] | None): JIDs das equipas de
+                manutenção disponíveis.
+            robots (list[str] | None): JIDs dos robots que podem transportar jobs.
+        """
         super().__init__(jid, password, env=env)
         self.agent_name = name
         self.position = position
 
-        # fila de jobs
         self.job_queue = []
         self.current_job = None
         self.current_job_ticks = 0
 
         self.max_queue = max_queue
 
-        # suppliers conhecidos (lista de JIDs em string)
         self.suppliers = suppliers or []
 
-        # materiais por job
         self.material_requirements = material_requirements or {
             "material_1": 10,
             "material_2": 5,
         }
 
-        # --- Pipeline ---
         self.pipeline_template = ["step0", "step1", "step2", "step3"]
         self.step_durations = {
             "step0": 1,
@@ -54,7 +88,6 @@ class MachineAgent(FactoryAgent):
             "step3": 2,
         }
 
-        # --- Falhas / Manutenção ---
         self.failure_rate = failure_rate
         self.is_failed = False
         self.maintenance_crews = maintenance_crews or []
@@ -62,13 +95,26 @@ class MachineAgent(FactoryAgent):
         self.maintenance_requested = False
         self.repair_in_progress = False
 
-        # --- Transferência de jobs ---
-        self.job_transfer_done = False  # se já tentou/fez transferência do job atual
+        self.job_transfer_done = False
 
-        # marcar que é máquina
         self.is_machine = True
 
     async def setup(self):
+        """Configura a máquina após o arranque.
+
+        Este método:
+
+        1. Chama o `setup` base (:class:`FactoryAgent`) para registo no ambiente.
+        2. Regista em log a posição, a capacidade da fila, os suppliers e o
+           pipeline.
+        3. Adiciona vários comportamentos que implementam:
+            - CNP com Supervisor (``JobDispatchParticipant``),
+            - Execução de jobs (``JobExecutor``),
+            - Pedido de manutenção (``MaintenanceRequester``),
+            - Receção de respostas de manutenção (``MaintenanceResponseHandler``),
+            - CNP de transferência (``JobTransferInitiator``, ``JobTransferParticipant``),
+            - Receção de jobs transferidos (``JobTransferReceiver``).
+        """
         await super().setup()
         await self.log(
             f"Machine {self.agent_name} pronta. pos={self.position}, "
@@ -84,11 +130,21 @@ class MachineAgent(FactoryAgent):
         self.add_behaviour(self.JobTransferParticipant())
         self.add_behaviour(self.JobTransferReceiver())
 
-    # ==========================================================
-    # FUNÇÃO AUXILIAR: registar falha
-    # ==========================================================
+
     async def handle_failure(self, job):
-        """Marca a máquina como falhada e prepara manutenção/transferência."""
+        """Marca a máquina como falhada e regista a ocorrência de falha.
+
+        Ao ser chamada, esta função:
+
+        - Marca a máquina como falhada (`is_failed = True`).
+        - Reinicia flags de manutenção e transferência de job.
+        - Incrementa a métrica ``env.metrics["machine_failures"]``.
+        - Regista no log a etapa do pipeline onde ocorreu a falha.
+
+        Args:
+            job (dict): Dicionário com o estado do job atual, incluindo
+                pipeline e índice da etapa atual.
+        """
         if self.is_failed:
             return
 
@@ -106,18 +162,42 @@ class MachineAgent(FactoryAgent):
         )
 
     async def transfer_job_via_robots(self, job, dest_machine_jid, beh):
-        """
-        Usa robots (transport-cnp, kind='job') para transportar o job
-        desta máquina até dest_machine_jid.
-        - job: dicionário com estado (id, pipeline, current_step_idx, remaining_ticks, ...)
-        - dest_machine_jid: JID em string
-        - beh: behaviour que chama (para usar send/receive)
+        """Transfere um job para outra máquina usando robots (transport-cnp).
+
+        Este método:
+
+        1. Verifica se existem robots configurados.
+        2. Obtém a posição da máquina de destino a partir do ambiente (`env`).
+        3. Constrói um payload de transporte de job:
+            - ``kind = "job"``
+            - posição de origem e destino,
+            - estado do job (pipeline, etapa atual, ticks restantes, etc.).
+        4. Inicia um CNP de transporte com robots via protocolo
+           ``"transport-cnp"``:
+            - Envia CFP para todos os robots.
+            - Recolhe PROPOSE/REFUSE.
+            - Seleciona o robot com menor custo.
+            - Envia REJECT para os restantes.
+            - Envia ACCEPT-PROPOSAL ao robot vencedor.
+        5. Aguarda um INFORM de conclusão de transporte. Se receber
+           ``status="delivered"`` e ``kind="job"``, considera a transferência
+           bem sucedida.
+
+        Args:
+            job (dict): Estado serializável do job a transferir
+                (id, pipeline, current_step_idx, remaining_ticks, etc.).
+            dest_machine_jid (str): JID da máquina de destino.
+            beh (spade.behaviour.CyclicBehaviour): Comportamento chamador,
+                usado para `send`/`receive` no contexto correto.
+
+        Returns:
+            bool: ``True`` se a transferência foi confirmada por INFORM,
+            ``False`` caso contrário (incluindo timeouts ou ausência de robots).
         """
         if not self.robots:
             await self.log("[TRANSFER/ROBOT] ERRO: nenhum robot configurado.")
             return False
 
-        # descobrir posição da máquina destino
         dest_pos = None
         if self.env:
             for a in self.env.agents:
@@ -133,7 +213,6 @@ class MachineAgent(FactoryAgent):
 
         origin_pos = list(self.position)
 
-        # construir payload genérico para o robot
         task = {
             "kind": "job",
             "origin_pos": origin_pos,
@@ -144,7 +223,6 @@ class MachineAgent(FactoryAgent):
 
         thread_id = f"jobtrans-{job['id']}-{self.env.time if self.env else random.randint(0,9999)}"
 
-        # Enviar CFP para todos os robots
         for r_jid in self.robots:
             m = Message(to=r_jid)
             m.set_metadata("protocol", "transport-cnp")
@@ -158,7 +236,6 @@ class MachineAgent(FactoryAgent):
             f"para job {job['id']} (thread={thread_id})."
         )
 
-        # Recolher PROPOSE
         proposals = []
         deadline = asyncio.get_event_loop().time() + 3
 
@@ -192,7 +269,6 @@ class MachineAgent(FactoryAgent):
             )
             return False
 
-        # escolher robot com menor custo
         proposals.sort(key=lambda x: x[1])
         winner_jid, winner_cost = proposals[0]
 
@@ -201,7 +277,6 @@ class MachineAgent(FactoryAgent):
             f"{winner_jid} (cost={winner_cost})."
         )
 
-        # REJECT aos restantes
         for jid, _ in proposals[1:]:
             rej = Message(to=jid)
             rej.set_metadata("protocol", "transport-cnp")
@@ -210,7 +285,6 @@ class MachineAgent(FactoryAgent):
             rej.body = json.dumps({"reason": "not_selected"})
             await beh.send(rej)
 
-        # ACCEPT ao vencedor
         acc = Message(to=winner_jid)
         acc.set_metadata("protocol", "transport-cnp")
         acc.set_metadata("performative", "accept-proposal")
@@ -218,7 +292,6 @@ class MachineAgent(FactoryAgent):
         acc.body = json.dumps(task)
         await beh.send(acc)
 
-        # Esperar INFORM de conclusão
         deadline_inf = asyncio.get_event_loop().time() + 10
         while asyncio.get_event_loop().time() < deadline_inf:
             rep = await beh.receive(timeout=0.5)
@@ -250,12 +323,35 @@ class MachineAgent(FactoryAgent):
         )
         return False
 
-
-    # ==========================================================
-    # PASSO 1 – CNP com Supervisor (job-dispatch)
-    # ==========================================================
     class JobDispatchParticipant(CyclicBehaviour):
+        """Participante no CNP de jobs com o Supervisor (job-dispatch).
+
+        Este comportamento trata das mensagens do protocolo ``"job-dispatch"``:
+
+        - CFP:
+            * Se a máquina estiver falhada → REFUSE ``"failed"``.
+            * Se a fila estiver cheia → REFUSE ``"queue_full"``.
+            * Caso contrário, PROPOSE com custo = tamanho da fila.
+        - ACCEPT-PROPOSAL:
+            * Cria um novo job com o pipeline padrão e adiciona-o à fila.
+            * Envia INFORM ao Supervisor a confirmar aceitação.
+        - REJECT-PROPOSAL:
+            * Apenas regista em log.
+        """
+
         async def run(self):
+            """Processa uma mensagem do CNP de dispatch por iteração.
+
+            Em cada iteração:
+
+            1. Tenta receber uma mensagem com timeout de 0.5 s.
+            2. Se não for do protocolo ``"job-dispatch"``, ignora.
+            3. Consoante o `performative`:
+                - ``"cfp"`` → decide entre PROPOSE/REFUSE com base na fila
+                  e no estado de falha.
+                - ``"accept-proposal"`` → enfileira novo job.
+                - ``"reject-proposal"`` → apenas log.
+            """
             agent = self.agent
 
             msg = await self.receive(timeout=0.5)
@@ -273,9 +369,7 @@ class MachineAgent(FactoryAgent):
             except Exception:
                 job_spec = {}
 
-            # CFP → decidir se propõe ou recusa
             if pf == "cfp":
-                # se falhada, recusa logo
                 if agent.is_failed:
                     rep = Message(to=str(msg.sender))
                     rep.set_metadata("protocol", "job-dispatch")
@@ -288,7 +382,6 @@ class MachineAgent(FactoryAgent):
                     )
                     return
 
-                # fila cheia → recusa
                 if len(agent.job_queue) >= agent.max_queue:
                     rep = Message(to=str(msg.sender))
                     rep.set_metadata("protocol", "job-dispatch")
@@ -303,7 +396,6 @@ class MachineAgent(FactoryAgent):
                     )
                     return
 
-                # custo = tamanho da fila (menos = melhor)
                 cost = len(agent.job_queue)
 
                 rep = Message(to=str(msg.sender))
@@ -318,15 +410,14 @@ class MachineAgent(FactoryAgent):
                 )
                 return
 
-            # ACCEPT-PROPOSAL → enfileirar o job (já com pipeline)
             if pf == "accept-proposal":
                 job_id = job_spec.get("job_id")
 
                 job = {
                     "id": job_id,
                     "pipeline": agent.pipeline_template.copy(),
-                    "current_step_idx": 0,   # começa em step0
-                    "materials_ok": False,   # tratado em step0
+                    "current_step_idx": 0,
+                    "materials_ok": False,
                 }
                 agent.job_queue.append(job)
 
@@ -343,18 +434,42 @@ class MachineAgent(FactoryAgent):
                 await self.send(rep)
                 return
 
-            # REJECT-PROPOSAL → só logar
             if pf == "reject-proposal":
                 await agent.log(
                     f"[JOB-DISPATCH] REJECT recebido de {msg.sender}."
                 )
                 return
 
-    # ==========================================================
-    # PASSO 2 – CNP com Suppliers (supply-cnp) → materiais
-    # ==========================================================
     async def request_materials_via_cnp(self, beh, job):
-        """Lança um CNP 'supply-cnp' aos suppliers para obter materiais."""
+        """Lança um CNP ``"supply-cnp"`` aos suppliers para obter materiais.
+
+        Este método:
+
+        1. Verifica se existem suppliers configurados.
+        2. Envia uma CFP para todos os suppliers com:
+            - materiais necessários (`material_requirements`);
+            - posição da máquina.
+        3. Recolhe PROPOSE/REFUSE dos suppliers:
+            - Seleciona o supplier com menor custo.
+            - Envia REJECT aos restantes.
+            - Envia ACCEPT-PROPOSAL ao vencedor.
+        4. Aguarda INFORM final:
+            - Se receber ``status="delivered"``:
+                * marca `job["materials_ok"] = True`;
+                * atualiza métricas de sucesso.
+            - Em caso de timeout:
+                * atualiza métricas de falha.
+
+        Args:
+            beh (spade.behaviour.CyclicBehaviour): Comportamento chamador,
+                usado para `send`/`receive` durante o CNP.
+            job (dict): Dicionário de estado do job para o qual os materiais
+                são pedidos.
+
+        Returns:
+            bool: ``True`` se os materiais foram entregues com sucesso,
+            ``False`` caso contrário.
+        """
         if not self.suppliers:
             await self.log("[SUPPLY] Nenhum supplier configurado. Job não avança.")
             return False
@@ -369,7 +484,6 @@ class MachineAgent(FactoryAgent):
 
         thread_id = f"supply-{self.agent_name}-{random.randint(0, 9999)}"
 
-        # Enviar CFP para todos os suppliers
         for sup_jid in self.suppliers:
             m = Message(to=sup_jid)
             m.set_metadata("protocol", "supply-cnp")
@@ -383,9 +497,8 @@ class MachineAgent(FactoryAgent):
             f"para materiais={materials_needed} (thread={thread_id})"
         )
 
-        # Recolher PROPOSE
         proposals = []
-        deadline = asyncio.get_event_loop().time() + 3  # 3s
+        deadline = asyncio.get_event_loop().time() + 3
 
         while asyncio.get_event_loop().time() < deadline:
             rep = await beh.receive(timeout=0.5)
@@ -413,7 +526,6 @@ class MachineAgent(FactoryAgent):
                 self.env.metrics["supply_requests_failed"] += 1
             return False
 
-        # Escolher supplier com menor custo
         proposals.sort(key=lambda x: x[1])
         winner_jid, winner_cost, winner_data = proposals[0]
 
@@ -422,7 +534,6 @@ class MachineAgent(FactoryAgent):
             "Enviando ACCEPT-PROPOSAL."
         )
 
-        # REJECT aos restantes
         for sup_jid, _, _ in proposals[1:]:
             rej = Message(to=sup_jid)
             rej.set_metadata("protocol", "supply-cnp")
@@ -431,7 +542,6 @@ class MachineAgent(FactoryAgent):
             rej.body = json.dumps({"reason": "not_selected"})
             await beh.send(rej)
 
-        # ACCEPT ao vencedor
         acc = Message(to=winner_jid)
         acc.set_metadata("protocol", "supply-cnp")
         acc.set_metadata("performative", "accept-proposal")
@@ -442,7 +552,6 @@ class MachineAgent(FactoryAgent):
         })
         await beh.send(acc)
 
-        # Esperar INFORM final
         deadline_inf = asyncio.get_event_loop().time() + 10
         while asyncio.get_event_loop().time() < deadline_inf:
             rep = await beh.receive(timeout=0.5)
@@ -476,21 +585,54 @@ class MachineAgent(FactoryAgent):
             self.env.metrics["supply_requests_failed"] += 1
         return False
 
-    # ==========================================================
-    # EXECUTOR DO JOB (pipeline + falhas)
-    # ==========================================================
     class JobExecutor(CyclicBehaviour):
+        """Executa o pipeline de jobs na máquina e trata de falhas.
+
+        Responsabilidades:
+
+        - Selecionar jobs da fila quando não há `current_job`.
+        - Iniciar ou retomar a execução do job na etapa correta.
+        - Em ``step0``:
+            * Se não tiver ``materials_ok``, pedir materiais via CNP aos suppliers.
+            * Em caso de falha de supply, marcar job como perdido.
+        - Em ``step1``, ``step2``, ``step3``:
+            * A cada tick, decrementar `current_job_ticks`.
+            * Com probabilidade `failure_rate`, provocar falha da máquina.
+            * Quando os ticks da etapa acabam, avançar para a etapa seguinte
+              ou concluir o job (atualizando métricas).
+        """
+
         async def run(self):
+            """Executa um ciclo de processamento do job.
+
+            Em cada iteração:
+
+            1. Se a máquina estiver falhada:
+                - Incrementa a métrica de `downtime_ticks`.
+                - Aguard
+            2. Se não existir `current_job` mas houver jobs na fila:
+                - Extrai o próximo job.
+                - Garante que tem `pipeline`, `current_step_idx` e `materials_ok`.
+                - Define `current_job_ticks` (podendo vir de `remaining_ticks`
+                  em caso de transferência).
+            3. Se o `current_step` for ``"step0"``:
+                - Se não tiver materiais, chama
+                  :meth:`MachineAgent.request_materials_via_cnp`.
+                - Em caso de sucesso, avança imediatamente para ``step1``
+                  ou termina o job se só houver step0.
+            4. Para steps posteriores:
+                - Pode ocorrer falha com probabilidade `failure_rate`.
+                - Decrementa `current_job_ticks` e regista progresso.
+                - Ao terminar a etapa, avança no pipeline ou marca job concluído.
+            """
             agent = self.agent
 
-            # Se está falhada, contar downtime e não fazer nada
             if agent.is_failed:
                 if agent.env:
                     agent.env.metrics["downtime_ticks"] += 1
                 await asyncio.sleep(1)
                 return
 
-            # Se não há job atual, tenta ir buscar da fila
             if agent.current_job is None and agent.job_queue:
                 agent.current_job = agent.job_queue.pop(0)
                 job = agent.current_job
@@ -499,14 +641,12 @@ class MachineAgent(FactoryAgent):
                 if "current_step_idx" not in job:
                     job["current_step_idx"] = 0
                 if "materials_ok" not in job:
-                    # se o job já vem de um step>0 (transferência), assumimos que já tem materiais
                     job["materials_ok"] = job["current_step_idx"] > 0
 
                 pipeline = job["pipeline"]
                 idx = job["current_step_idx"]
                 current_step = pipeline[idx]
 
-                # se veio de transferência, pode trazer remaining_ticks
                 if "remaining_ticks" in job:
                     agent.current_job_ticks = job.pop("remaining_ticks")
                 else:
@@ -526,7 +666,6 @@ class MachineAgent(FactoryAgent):
             idx = job["current_step_idx"]
             current_step = pipeline[idx]
 
-            # STEP0: garantir materiais via CNP-Recursos
             if current_step == "step0":
                 if not job.get("materials_ok", False):
                     ok = await agent.request_materials_via_cnp(self, job)
@@ -545,7 +684,6 @@ class MachineAgent(FactoryAgent):
                         f"[JOB] Job {job['id']} concluiu step0 (materiais consumidos)."
                     )
 
-                    # Passa logo para o step1
                     if idx < len(pipeline) - 1:
                         job["current_step_idx"] += 1
                         next_step = pipeline[job["current_step_idx"]]
@@ -557,7 +695,6 @@ class MachineAgent(FactoryAgent):
                         await asyncio.sleep(0.5)
                         return
                     else:
-                        # Caso extremo: só step0
                         await agent.log(
                             f"[JOB] Job {job['id']} concluído (após step0)."
                         )
@@ -568,28 +705,21 @@ class MachineAgent(FactoryAgent):
                         await asyncio.sleep(0.5)
                         return
 
-                # se já tinha materials_ok=True, deixa seguir para lógica normal
-
-            # *** A PARTIR DAQUI, current_step NUNCA É step0 ***
-            # Falha só pode acontecer em step1/2/3
             pipeline = job["pipeline"]
             idx = job["current_step_idx"]
             current_step = pipeline[idx]
 
             if current_step != "step0":
-                # probabilidade de falhar neste tick
                 if random.random() < agent.failure_rate:
                     await agent.handle_failure(job)
                     return
 
-            # STEP1, STEP2, STEP3 → contagem de ticks
             agent.current_job_ticks -= 1
             await agent.log(
                 f"[JOB] job_id={job['id']} etapa={current_step}, "
                 f"ticks_rest={agent.current_job_ticks}"
             )
 
-            # etapa concluída?
             if agent.current_job_ticks <= 0:
                 if idx < len(pipeline) - 1:
                     job["current_step_idx"] += 1
@@ -611,14 +741,47 @@ class MachineAgent(FactoryAgent):
 
             await asyncio.sleep(1)
 
-    # ==========================================================
-    # CNP de MANUTENÇÃO (Machine → MaintenanceCrew)
-    # ==========================================================
+
     class MaintenanceRequester(CyclicBehaviour):
+        """Inicia CNP de manutenção com as equipas de manutenção.
+
+        Este comportamento:
+
+        - Só atua quando a máquina está falhada (`is_failed`) e ainda não
+          foi feito pedido de manutenção (`maintenance_requested` = False).
+        - Envia CFP para todas as `maintenance_crews` com:
+            * JID da máquina;
+            * posição da máquina.
+        - Recolhe PROPOSE/REFUSE das crews.
+        - Escolhe a crew com menor custo e:
+            * Envia REJECT às outras;
+            * Envia ACCEPT-PROPOSAL à vencedora com tempo de reparação.
+        - Atualiza flags (`repair_in_progress`) e métricas
+          (``repairs_started``) no ambiente.
+        """
+
         async def run(self):
+            """Executa um ciclo de pedido de manutenção.
+
+            Lógica:
+
+            1. Se a máquina não estiver falhada ou já tiver pedido manutenção,
+               dorme e sai.
+            2. Caso contrário:
+                - Verifica se existem crews configuradas.
+                - Envia CFP a todas as crews via protocolo ``"maintenance-cnp"``.
+                - Recolhe respostas durante um tempo limite.
+                - Se não houver propostas:
+                    * Regista no log que não há crews disponíveis.
+                - Se houver:
+                    * Escolhe a proposta de menor custo.
+                    * Envia REJECT às restantes.
+                    * Envia ACCEPT-PROPOSAL à vencedora com dados da máquina
+                      e `repair_time`.
+                    * Marca que há reparação em progresso.
+            """
             agent = self.agent
 
-            # só atua se máquina falhada e ainda não pediu manutenção
             if not agent.is_failed or agent.maintenance_requested:
                 await asyncio.sleep(0.5)
                 return
@@ -635,7 +798,6 @@ class MachineAgent(FactoryAgent):
                 "machine_pos": list(agent.position),
             }
 
-            # enviar CFP a todas as crews
             for crew_jid in agent.maintenance_crews:
                 m = Message(to=crew_jid)
                 m.set_metadata("protocol", "maintenance-cnp")
@@ -649,7 +811,6 @@ class MachineAgent(FactoryAgent):
                 f"(thread={thread_id})"
             )
 
-            # recolher propostas
             proposals = []
             deadline = asyncio.get_event_loop().time() + 3
 
@@ -680,11 +841,8 @@ class MachineAgent(FactoryAgent):
 
             if not proposals:
                 await agent.log("[MAINT-REQ] Nenhuma crew disponível. Tentará depois.")
-                # vai voltar a tentar, porque maintenance_requested já está True
-                # se quiseres voltar a False para repetir o CFP constantemente, muda aqui.
                 return
 
-            # escolhe crew com menor custo
             proposals.sort(key=lambda x: x[1])
             winner_jid, winner_cost, winner_rt = proposals[0]
 
@@ -693,7 +851,6 @@ class MachineAgent(FactoryAgent):
                 f"repair_time={winner_rt})."
             )
 
-            # REJECT aos outros
             for crew_jid, _, _ in proposals[1:]:
                 rej = Message(to=crew_jid)
                 rej.set_metadata("protocol", "maintenance-cnp")
@@ -702,7 +859,6 @@ class MachineAgent(FactoryAgent):
                 rej.body = json.dumps({"reason": "not_selected"})
                 await self.send(rej)
 
-            # ACCEPT ao vencedor
             acc = Message(to=winner_jid)
             acc.set_metadata("protocol", "maintenance-cnp")
             acc.set_metadata("performative", "accept-proposal")
@@ -719,7 +875,21 @@ class MachineAgent(FactoryAgent):
                 agent.env.metrics["repairs_started"] += 1
 
     class MaintenanceResponseHandler(CyclicBehaviour):
+        """Trata respostas INFORM das equipas de manutenção.
+
+        Este comportamento escuta o protocolo ``"maintenance-cnp"`` e:
+
+        - Quando recebe INFORM com ``status="repair_started"``:
+            * Regista no log que a reparação começou.
+        - Quando recebe INFORM com ``status="repair_completed"``:
+            * Marca a máquina como operacional (`is_failed = False`).
+            * Limpa flags de reparação (`repair_in_progress`,
+              `maintenance_requested`).
+            * Regista no log a conclusão da reparação.
+        """
+
         async def run(self):
+            """Processa uma mensagem de resposta de manutenção, se existir."""
             agent = self.agent
 
             msg = await self.receive(timeout=0.5)
@@ -748,17 +918,37 @@ class MachineAgent(FactoryAgent):
 
                     await agent.log("[MAINT] Reparação concluída. Máquina operacional.")
 
-       # ==========================================================
-    # CNP de TRANSFERÊNCIA DE JOB (Machine → outras Machines via Robots)
-    # ==========================================================
+
     class JobTransferInitiator(CyclicBehaviour):
+        """Inicia CNP de transferência de job para outras máquinas.
+
+        Este comportamento é usado quando:
+
+        - A máquina está falhada (`is_failed`).
+        - Existe um job atual (`current_job`).
+        - Ainda não foi feita/terminada uma tentativa de transferência
+          (`job_transfer_done` = False).
+
+        Passos:
+
+        1. Descobre outras máquinas registadas no ambiente (`env.agents`).
+        2. Empacota o estado do job (pipeline, índice, materials_ok,
+           remaining_ticks, etc.).
+        3. Envia CFP a essas máquinas usando protocolo ``"transfer-cnp"``.
+        4. Recolhe PROPOSE/REFUSE e escolhe a máquina com menor custo
+           (por ex., fila mais pequena).
+        5. Envia REJECT aos restantes, ACCEPT-PROPOSAL ao vencedor.
+        6. Chama :meth:`MachineAgent.transfer_job_via_robots` para transportar
+           o job até à máquina destino via robots.
+        7. Se a transferência for bem sucedida:
+            * Liberta o job atual;
+            * Atualiza `job_transfer_done`.
+        """
+
         async def run(self):
+            """Executa um ciclo de tentativa de transferência de job."""
             agent = self.agent
 
-            # Só faz sentido se:
-            #  - máquina está falhada
-            #  - tem um job atual
-            #  - ainda não tentou/fez transferência
             if (
                 not agent.is_failed
                 or agent.current_job is None
@@ -767,12 +957,10 @@ class MachineAgent(FactoryAgent):
                 await asyncio.sleep(0.5)
                 return
 
-            # Não há ambiente → impossível descobrir outras máquinas
             if not agent.env:
                 await asyncio.sleep(0.5)
                 return
 
-            # Candidatos = outras máquinas registadas no ambiente
             candidates = [
                 a for a in agent.env.agents
                 if getattr(a, "is_machine", False) and a.jid != agent.jid
@@ -786,7 +974,6 @@ class MachineAgent(FactoryAgent):
 
             job = agent.current_job
 
-            # Empacotar estado do job
             job_data = {
                 "id": job["id"],
                 "pipeline": job["pipeline"],
@@ -802,7 +989,6 @@ class MachineAgent(FactoryAgent):
 
             thread_id = f"transfer-{job['id']}-{agent.env.time}"
 
-            # Enviar CFP para todas as outras máquinas
             for m in candidates:
                 msg = Message(to=str(m.jid))
                 msg.set_metadata("protocol", "transfer-cnp")
@@ -817,7 +1003,6 @@ class MachineAgent(FactoryAgent):
                 f"(thread={thread_id})."
             )
 
-            # Recolher PROPOSE / REFUSE
             proposals = []
             deadline = asyncio.get_event_loop().time() + 3
 
@@ -851,7 +1036,6 @@ class MachineAgent(FactoryAgent):
                 await asyncio.sleep(0.5)
                 return
 
-            # Escolher máquina com menor custo (fila mais pequena, por ex.)
             proposals.sort(key=lambda x: x[1])
             winner_jid, winner_cost = proposals[0]
 
@@ -860,7 +1044,6 @@ class MachineAgent(FactoryAgent):
                 f"{winner_jid} (cost={winner_cost}, candidatos={proposals})"
             )
 
-            # Enviar REJECT aos restantes
             for jid, _ in proposals[1:]:
                 rej = Message(to=jid)
                 rej.set_metadata("protocol", "transfer-cnp")
@@ -869,7 +1052,6 @@ class MachineAgent(FactoryAgent):
                 rej.body = json.dumps({"reason": "not_selected"})
                 await self.send(rej)
 
-            # Enviar ACCEPT ao vencedor (apenas para este “saber” que foi escolhido)
             acc = Message(to=winner_jid)
             acc.set_metadata("protocol", "transfer-cnp")
             acc.set_metadata("performative", "accept-proposal")
@@ -877,11 +1059,9 @@ class MachineAgent(FactoryAgent):
             acc.body = json.dumps({"job_id": job["id"]})
             await self.send(acc)
 
-            # Agora entra a parte nova: transporte do job via robots
             ok = await agent.transfer_job_via_robots(job_data, winner_jid, self)
 
             if ok:
-                # Job foi fisicamente transferido; esta máquina liberta o job
                 agent.current_job = None
                 agent.current_job_ticks = 0
                 agent.job_transfer_done = True
@@ -892,10 +1072,24 @@ class MachineAgent(FactoryAgent):
                 await agent.log(
                     f"[TRANSFER] Falha na transferência via robots para {winner_jid}."
                 )
-                agent.job_transfer_done = True  # evita loops infinitos
+                agent.job_transfer_done = True
 
     class JobTransferParticipant(CyclicBehaviour):
+        """Participa no CNP de transferência de jobs como máquina candidata.
+
+        Lado da máquina que pode receber jobs transferidos:
+
+        - CFP:
+            * Se máquina estiver falhada ou fila cheia, REFUSE.
+            * Caso contrário, PROPOSE com custo = tamanho da fila.
+        - ACCEPT-PROPOSAL:
+            * Apenas regista que foi escolhida, aguardando entrega via robot.
+        - REJECT-PROPOSAL:
+            * Apenas regista que não foi escolhida.
+        """
+
         async def run(self):
+            """Processa mensagens do protocolo ``"transfer-cnp"`` por iteração."""
             agent = self.agent
 
             msg = await self.receive(timeout=0.5)
@@ -913,9 +1107,7 @@ class MachineAgent(FactoryAgent):
             except Exception:
                 data = {}
 
-            # CFP → decidir se pode receber job
             if pf == "cfp":
-                # Se falhada ou fila cheia → REFUSE
                 if agent.is_failed:
                     rep = Message(to=str(msg.sender))
                     rep.set_metadata("protocol", "transfer-cnp")
@@ -934,7 +1126,6 @@ class MachineAgent(FactoryAgent):
                     await self.send(rep)
                     return
 
-                # custo simples = tamanho da fila (quanto menor melhor)
                 cost = len(agent.job_queue)
 
                 rep = Message(to=str(msg.sender))
@@ -949,7 +1140,6 @@ class MachineAgent(FactoryAgent):
                 )
                 return
 
-            # ACCEPT-PROPOSAL → opcionalmente só logar (job chegará via robot)
             if pf == "accept-proposal":
                 job_id = data.get("job_id")
                 await agent.log(
@@ -958,19 +1148,24 @@ class MachineAgent(FactoryAgent):
                 )
                 return
 
-            # REJECT-PROPOSAL → só log
             if pf == "reject-proposal":
                 await agent.log("[TRANSFER] REJECT recebido (não fui escolhido).")
                 return
 
-            
-
     class JobTransferReceiver(CyclicBehaviour):
+        """Recebe jobs entregues por robots via protocolo ``"job-transfer"``.
+
+        Este comportamento:
+
+        - Escuta mensagens com protocolo ``"job-transfer"``.
+        - Se `status == "job_delivered"`:
+            * Valida o dicionário de job.
+            * Adiciona o job à `job_queue`.
+            * Regista no log o tamanho atualizado da fila.
         """
-        Recebe jobs entregues pelos robots (protocol 'job-transfer')
-        e coloca-os na fila da máquina destino.
-        """
+
         async def run(self):
+            """Processa uma mensagem de entrega de job."""
             agent = self.agent
             msg = await self.receive(timeout=0.5)
             if not msg:
@@ -997,6 +1192,3 @@ class MachineAgent(FactoryAgent):
                 f"[JOB-TRANSFER] Job {job.get('id')} entregue por robot e "
                 f"adicionado à fila (tam={len(agent.job_queue)})."
             )
-
-            
-
