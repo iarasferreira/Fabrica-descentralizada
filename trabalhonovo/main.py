@@ -58,7 +58,7 @@ async def main():
         env=env,
         name="Crew-B",
         position=(10, 5),
-        repair_time_range=(4, 8),
+        repair_time_range=(3, 7),
     )
 
     await maint1.start(auto_register=True)

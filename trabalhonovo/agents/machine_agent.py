@@ -21,7 +21,7 @@ class MachineAgent(FactoryAgent):
         suppliers=None,
         material_requirements=None,
         max_queue=15,
-        failure_rate=0.05,
+        failure_rate=0.10,
         maintenance_crews=None,  # lista de JIDs das crew
         robots=None,  # lista de JIDs dos robots
     ):
